@@ -7,6 +7,7 @@ import os
 import requests
 import yt_dlp
 import time
+import asyncio  # Added for delays
 from pathlib import Path
 
 # Enhanced logging setup
@@ -50,8 +51,9 @@ except Exception as e:
     logger.error(f"Spotify setup failed: {str(e)}")
     raise
 
-# Function to search YouTube using yt-dlp (updated for better matching)
+# Function to search YouTube using yt-dlp (updated to bypass bot detection)
 async def search_youtube(song_name: str, singer: str) -> str:
+    # Mimic a real browser's user-agent to reduce bot detection
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -59,6 +61,7 @@ async def search_youtube(song_name: str, singer: str) -> str:
         'force_generic_extractor': True,
         'geo_bypass': True,  # Bypass geographic restrictions
         'no_check_certificate': True,  # Avoid SSL issues
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',  # Mimic Chrome
     }
     # Broaden the search queries to match common video titles
     search_queries = [
@@ -73,7 +76,7 @@ async def search_youtube(song_name: str, singer: str) -> str:
         try:
             logger.info(f"Searching YouTube with query: {query}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(f"ytsearch5:{query}", download=False)  # Increase to 5 results
+                result = ydl.extract_info(f"ytsearch5:{query}", download=False)  # Search for 5 results
                 if 'entries' in result and result['entries']:
                     for entry in result['entries'][:5]:
                         url = entry['url']
@@ -84,6 +87,7 @@ async def search_youtube(song_name: str, singer: str) -> str:
                             'simulate': True,
                             'geo_bypass': True,
                             'no_check_certificate': True,
+                            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
                         }
                         with yt_dlp.YoutubeDL(test_opts) as test_ydl:
                             try:
@@ -96,7 +100,13 @@ async def search_youtube(song_name: str, singer: str) -> str:
             logger.warning(f"No downloadable URLs found for query: {query}")
         except Exception as e:
             logger.error(f"Error searching YouTube for {query}: {str(e)}")
+            # If bot detection error occurs, log it and continue to the next query
+            if "Sign in to confirm you’re not a bot" in str(e):
+                logger.warning("YouTube bot detection triggered. Trying next query...")
             continue
+        finally:
+            # Add a small delay between searches to avoid rate-limiting
+            await asyncio.sleep(2)  # Delay of 2 seconds between requests
     logger.warning(f"No valid URLs found for {song_name}")
     return None
 
@@ -115,6 +125,7 @@ async def download_youtube_audio(url: str, output_name: str) -> str:
         'audioformat': 'm4a',  # Use YouTube's native format
         'prefer_ffmpeg': False,
         'keepvideo': False,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',  # Add user-agent here too
     }
 
     for attempt in range(3):
