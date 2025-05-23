@@ -260,6 +260,10 @@ async def download_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             playlist_text += "\nWhich song would you like to download? Just type the number (e.g., 1)! Or, type a new singer's name to create another playlist! 🌟"
             await update.message.reply_text(playlist_text)
             return DOWNLOAD
+        except Exception as e:
+            logger.error(f"Error in singer search for {user_input}: {str(e)}")
+            await update.message.reply_text(f"Oops! Something went wrong while searching for {user_input}. Error: {str(e)}. Let's try again! 😊")
+            return SINGER
 
     # Proceed with downloading the selected song
     try:
