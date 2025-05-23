@@ -1,373 +1,362 @@
-﻿import logging
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+﻿import os
+import logging
+import tempfile
+import time
+from pathlib import Path
+from typing import Dict, List
+
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
-import os
-import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+    ConversationHandler,
+)
 import yt_dlp
-import time
-import asyncio  # Added for delays
-from pathlib import Path
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Enhanced logging setup
+# Constants
+LANGUAGE, ARTIST, SONG_SELECTION = range(3)
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Telegram limit
+DOWNLOAD_TIMEOUT = 300  # 5 minutes
+SPOTIFY_RETRIES = 3
+YT_RETRIES = 3
+YT_DELAY = 2  # seconds between YouTube requests
+
+# Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-LANGUAGE, SINGER, DOWNLOAD = range(3)
-
-# Global dictionary to store user data
-user_data = {}
-
-# Configuration
-CONFIG = {
-    'SPOTIFY_CLIENT_ID': os.getenv('SPOTIFY_CLIENT_ID'),
-    'SPOTIFY_CLIENT_SECRET': os.getenv('SPOTIFY_CLIENT_SECRET'),
-    'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
-    'MAX_FILE_SIZE_MB': 50,
-    'TEMP_DIR': 'temp_downloads',
-}
+# Environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 # Ensure temp directory exists
-Path(CONFIG['TEMP_DIR']).mkdir(exist_ok=True)
+TEMP_DIR = Path("temp_downloads")
+TEMP_DIR.mkdir(exist_ok=True)
+
+# Configure requests session with retries
+session = requests.Session()
+retry = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 # Initialize Spotify client
-try:
-    auth_manager = SpotifyClientCredentials(
-        client_id=CONFIG['SPOTIFY_CLIENT_ID'],
-        client_secret=CONFIG['SPOTIFY_CLIENT_SECRET']
-    )
-    sp = spotipy.Spotify(auth_manager=auth_manager)
-    logger.info("Spotify client initialized successfully")
-except Exception as e:
-    logger.error(f"Spotify setup failed: {str(e)}")
-    raise
+auth_manager = SpotifyClientCredentials(
+    client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET
+)
+sp = spotipy.Spotify(auth_manager=auth_manager, requests_session=session)
 
-# Function to search YouTube using yt-dlp (updated to bypass bot detection)
-async def search_youtube(song_name: str, singer: str) -> str:
-    # Mimic a real browser's user-agent to reduce bot detection
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'force_generic_extractor': True,
-        'geo_bypass': True,  # Bypass geographic restrictions
-        'no_check_certificate': True,  # Avoid SSL issues
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',  # Mimic Chrome
-    }
-    # Broaden the search queries to match common video titles
-    search_queries = [
-        f"{song_name} {singer} official video",
-        f"{song_name} {singer} official audio",
-        f"{song_name} {singer} official",
-        f"{song_name} {singer}",
-        f"{song_name} audio {singer}",
-        f"{song_name} by {singer}",
-    ]
-    for query in search_queries:
-        try:
-            logger.info(f"Searching YouTube with query: {query}")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(f"ytsearch5:{query}", download=False)  # Search for 5 results
-                if 'entries' in result and result['entries']:
-                    for entry in result['entries'][:5]:
-                        url = entry['url']
-                        test_opts = {
-                            'format': 'bestaudio/best',
-                            'quiet': True,
-                            'no_warnings': True,
-                            'simulate': True,
-                            'geo_bypass': True,
-                            'no_check_certificate': True,
-                            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-                        }
-                        with yt_dlp.YoutubeDL(test_opts) as test_ydl:
-                            try:
-                                test_ydl.extract_info(url, download=False)
-                                logger.info(f"Found valid URL: {url}")
-                                return url
-                            except Exception as e:
-                                logger.warning(f"URL {url} failed test: {str(e)}")
-                                continue
-            logger.warning(f"No downloadable URLs found for query: {query}")
-        except Exception as e:
-            logger.error(f"Error searching YouTube for {query}: {str(e)}")
-            # If bot detection error occurs, log it and continue to the next query
-            if "Sign in to confirm you’re not a bot" in str(e):
-                logger.warning("YouTube bot detection triggered. Trying next query...")
-            continue
-        finally:
-            # Add a small delay between searches to avoid rate-limiting
-            await asyncio.sleep(2)  # Delay of 2 seconds between requests
-    logger.warning(f"No valid URLs found for {song_name}")
-    return None
+# User session data storage
+user_data: Dict[int, Dict] = {}
 
-# Function to download YouTube audio using yt-dlp (without FFmpeg)
-async def download_youtube_audio(url: str, output_name: str) -> str:
-    output_path = os.path.join(CONFIG['TEMP_DIR'], output_name)
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': output_path + '.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'retries': 3,
-        'socket_timeout': 30,
-        'extractaudio': True,
-        'audioformat': 'm4a',  # Use YouTube's native format
-        'prefer_ffmpeg': False,
-        'keepvideo': False,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',  # Add user-agent here too
-    }
 
-    for attempt in range(3):
-        try:
-            logger.info(f"Download attempt {attempt + 1} for {url}")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            
-            # Check for the file (can be .m4a or other audio format)
-            for ext in ['.m4a', '.webm', '.mp3']:
-                audio_path = f"{output_path}{ext}"
-                if os.path.exists(audio_path):
-                    logger.info(f"Successfully downloaded to {audio_path}")
-                    return audio_path
-            
-            raise Exception("Download completed but audio file not found")
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-            if attempt == 2:
-                raise Exception(f"Failed after 3 attempts: {str(e)}")
-            time.sleep(2)
-    
-    return None
-
-# Start command handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the conversation and ask user for language."""
     user = update.message.from_user
-    logger.info(f"Start command from {user.id} ({user.username})")
+    logger.info(f"User {user.id} started the bot.")
     
-    keyboard = [[InlineKeyboardButton("English", callback_data='lang_en')]]
+    keyboard = [
+        [InlineKeyboardButton("English", callback_data="en")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "Hello! I'm your Singer Playlist Bot. Let's get started! Which language would you like to use? 😊",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "Hello! I'm your Singer Playlist Bot. Let's get started! "
+        "Which language would you like to use? 😊",
+        reply_markup=reply_markup,
     )
+    
     return LANGUAGE
 
-# Language selection handler
+
 async def language_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle language selection."""
     query = update.callback_query
     await query.answer()
     
-    chat_id = query.message.chat_id
-    lang = query.data.split('_')[1]
-    user_data[chat_id] = {'lang': lang}
+    user_id = query.from_user.id
+    user_data[user_id] = {"language": query.data}
     
-    await query.edit_message_text("Awesome! Now, tell me the name of a singer to create a playlist for you! 🌟")
-    return SINGER
-
-# Singer name handler
-async def singer_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_id = update.message.chat_id
-    singer = update.message.text.strip()
-    user_data[chat_id]['singer'] = singer
+    await query.edit_message_text(
+        text="Awesome! Now, tell me the name of a singer to create a playlist for you! 🌟"
+    )
     
-    await update.message.reply_text(f"Searching for songs by {singer}... Please wait! ⏳")
+    return ARTIST
 
+
+async def get_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Get artist name and search for their top tracks."""
+    user = update.message.from_user
+    artist_name = update.message.text
+    logger.info(f"User {user.id} requested artist: {artist_name}")
+    
+    # Show searching message
+    await update.message.reply_text(
+        f"Searching for songs by {artist_name}... Please wait! ⏳"
+    )
+    
     try:
-        # Search for artist
-        results = sp.search(q=f'artist:{singer}', type='artist', limit=1)
-        if not results['artists']['items']:
-            await update.message.reply_text(f"Sorry, I couldn't find {singer}. Try another name! 😊")
-            return SINGER
-
-        # Get top tracks
-        artist_id = results['artists']['items'][0]['id']
-        tracks = sp.artist_top_tracks(artist_id)
-        song_list = [(track['name'], track['external_urls']['spotify']) for track in tracks['tracks'][:10]]
-        
-        # Find YouTube links
-        downloadable_songs = []
-        for song_name, _ in song_list:
+        # Search Spotify for artist's top tracks with retries
+        tracks = []
+        for attempt in range(SPOTIFY_RETRIES):
             try:
-                yt_url = await search_youtube(song_name, singer)
-                if yt_url:
-                    downloadable_songs.append((song_name, yt_url))
-                else:
-                    await update.message.reply_text(f"Couldn't find {song_name} on YouTube. Skipping...")
-            except Exception as e:
-                logger.error(f"Error searching for {song_name}: {str(e)}")
-                continue
-
-        if not downloadable_songs:
-            await update.message.reply_text("No downloadable songs found. Try another artist! 😊")
-            return SINGER
-
-        user_data[chat_id]['songs'] = downloadable_songs
+                # First search for the artist
+                result = sp.search(q=f"artist:{artist_name}", type="artist", limit=1)
+                if not result["artists"]["items"]:
+                    raise ValueError("Artist not found")
+                
+                artist_id = result["artists"]["items"][0]["id"]
+                
+                # Get top tracks
+                top_tracks = sp.artist_top_tracks(artist_id)
+                tracks = [
+                    {
+                        "name": track["name"],
+                        "artist": ", ".join(
+                            artist["name"] for artist in track["artists"]
+                        ),
+                        "full_query": f"{track['name']} {artist_name}",
+                    }
+                    for track in top_tracks["tracks"][:10]  # Limit to top 10
+                ]
+                break
+            except spotipy.SpotifyException as e:
+                if attempt == SPOTIFY_RETRIES - 1:
+                    raise
+                logger.warning(f"Spotify API attempt {attempt + 1} failed: {e}")
+                time.sleep(1)  # Wait before retrying
         
-        # Show playlist
-        playlist_text = f"🎵 Playlist for {singer}:\n\n"
-        for idx, (song_name, _) in enumerate(downloadable_songs, 1):
-            playlist_text += f"{idx}. {song_name}\n"
+        if not tracks:
+            await update.message.reply_text(
+                f"Couldn't find any tracks for {artist_name}. Please try another artist! 😊"
+            )
+            return ARTIST
         
-        playlist_text += "\nWhich song would you like to download? Type the number! Or, type a new singer's name to create another playlist! 🌟"
-        await update.message.reply_text(playlist_text)
-        return DOWNLOAD
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error with Spotify: {str(e)}")
-        await update.message.reply_text(f"Network issue while connecting to Spotify. Error: {str(e)}. Please check your internet and try again! 😊")
-        return SINGER
+        # Store tracks in user data
+        user_data[user.id] = {
+            **user_data.get(user.id, {}),
+            "artist": artist_name,
+            "tracks": tracks,
+        }
+        
+        # Format playlist message
+        playlist_msg = f"🎵 Playlist for {artist_name}:\n\n"
+        for i, track in enumerate(tracks, start=1):
+            playlist_msg += f"{i}. {track['name']}\n"
+        
+        playlist_msg += (
+            "\nWhich song would you like to download? Type the number! "
+            "Or, type a new singer's name to create another playlist! 🌟"
+        )
+        
+        await update.message.reply_text(playlist_msg)
+        
+        return SONG_SELECTION
+    
     except Exception as e:
-        logger.error(f"Error in singer_name: {str(e)}")
-        await update.message.reply_text(f"Oops! Something went wrong. Error: {str(e)}. Let's try again! 😊")
-        return SINGER
+        logger.error(f"Error searching for artist {artist_name}: {e}", exc_info=True)
+        await update.message.reply_text(
+            "Something went wrong while searching. Please try another artist! 😊"
+        )
+        return ARTIST
 
-# Download song handler
+
 async def download_song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_id = update.message.chat_id
-    user_input = update.message.text.strip()
-
-    # Check if the user entered a new singer's name instead of a number
+    """Download the selected song from YouTube."""
+    user = update.message.from_user
+    user_input = update.message.text
+    logger.info(f"User {user.id} input: {user_input}")
+    
+    # Check if user entered a new artist name instead of a number
+    if not user_input.isdigit():
+        return await get_artist(update, context)
+    
+    # Get selected track
     try:
-        song_idx = int(user_input) - 1
-    except ValueError:
-        # User entered a new singer's name, treat it as a new search
-        logger.info(f"User entered a new singer name: {user_input} from chat_id: {chat_id}")
-        user_data[chat_id]['singer'] = user_input
-        await update.message.reply_text(f"Got it! I'm searching for songs by {user_input}... Please wait a moment! 😊")
+        track_index = int(user_input) - 1
+        tracks = user_data[user.id]["tracks"]
+        if track_index < 0 or track_index >= len(tracks):
+            raise IndexError("Invalid track index")
+        
+        selected_track = tracks[track_index]
+        search_query = selected_track["full_query"]
+        
+        await update.message.reply_text(
+            f"⬇️ Downloading {selected_track['name']}... Please wait a moment! 😊"
+        )
+        
+        # Prepare yt-dlp options
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(TEMP_DIR / "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": False,
+            "noplaylist": True,
+            "default_search": "ytsearch",
+            "socket_timeout": 30,
+            "retries": 10,
+            "extractaudio": True,
+            "audioformat": "mp3",
+            "nocheckcertificate": True,
+            "ignoreerrors": True,
+            "logtostderr": False,
+            "restrictfilenames": True,
+            "no_color": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        }
+        
+        # Temporary file path
+        temp_file = None
         
         try:
-            results = sp.search(q=f'artist:{user_input}', type='artist', limit=1)
-            if not results['artists']['items']:
-                await update.message.reply_text(f"Sorry, I couldn't find any artist named {user_input}. Try another name! 😊")
-                return SINGER
-
-            artist_id = results['artists']['items'][0]['id']
-            tracks = sp.artist_top_tracks(artist_id)
-            song_list = [(track['name'], track['external_urls']['spotify']) for track in tracks['tracks'][:10]]
-
-            downloadable_songs = []
-            for song_name, _ in song_list:
+            # Search and download with yt-dlp with retries
+            for attempt in range(YT_RETRIES):
                 try:
-                    yt_url = await search_youtube(song_name, user_input)
-                    if yt_url:
-                        downloadable_songs.append((song_name, yt_url))
-                    else:
-                        await update.message.reply_text(f"Couldn't find a downloadable version of {song_name} on YouTube. Skipping this song... 😊")
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        # Add delay between YouTube requests
+                        if attempt > 0:
+                            time.sleep(YT_DELAY)
+                        
+                        info = ydl.extract_info(f"ytsearch:{search_query}", download=True)
+                        
+                        if not info or "entries" not in info or not info["entries"]:
+                            raise ValueError("No videos found")
+                        
+                        video = info["entries"][0]
+                        temp_file = TEMP_DIR / f"{video['title']}.mp3"
+                        
+                        # Check file size
+                        file_size = temp_file.stat().st_size
+                        if file_size > MAX_FILE_SIZE:
+                            raise ValueError(
+                                f"File too large ({file_size / 1024 / 1024:.2f}MB)"
+                            )
+                        
+                        # Send the audio file
+                        with open(temp_file, "rb") as audio_file:
+                            await update.message.reply_audio(
+                                audio=audio_file,
+                                title=video["title"],
+                                performer=selected_track["artist"],
+                                caption=f"{selected_track['name']} downloaded! Enjoy the music! 😊❤️",
+                            )
+                        
+                        break
+                except yt_dlp.utils.DownloadError as e:
+                    if "Sign in to confirm you're not a bot" in str(e):
+                        logger.warning(f"YouTube bot detection triggered (attempt {attempt + 1})")
+                        if attempt == YT_RETRIES - 1:
+                            raise RuntimeError("YouTube blocked the request. Please try again later.")
+                        continue
+                    raise
+        except Exception as e:
+            logger.error(f"Error downloading song: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"Sorry, I couldn't download the song. Error: {str(e)}. Please try another song! 😊"
+            )
+        finally:
+            # Clean up temporary file
+            if temp_file and temp_file.exists():
+                try:
+                    temp_file.unlink()
+                    logger.info(f"Deleted temporary file: {temp_file}")
                 except Exception as e:
-                    await update.message.reply_text(f"Error while searching for {song_name} on YouTube. Error: {str(e)}. Skipping this song... 😊")
-                    continue
-
-            if not downloadable_songs:
-                await update.message.reply_text(f"Sorry, I couldn't find any downloadable links for this singer. Try another name! 😊")
-                return SINGER
-
-            user_data[chat_id]['songs'] = downloadable_songs
-
-            playlist_text = f"Here's the playlist for {user_input}:\n\n"
-            for idx, (song_name, _) in enumerate(downloadable_songs, 1):
-                playlist_text += f"{idx}. {song_name}\n"
-            playlist_text += "\nWhich song would you like to download? Just type the number (e.g., 1)! Or, type a new singer's name to create another playlist! 🌟"
-            await update.message.reply_text(playlist_text)
-            return DOWNLOAD
-        except Exception as e:
-            logger.error(f"Error in singer search for {user_input}: {str(e)}")
-            await update.message.reply_text(f"Oops! Something went wrong while searching for {user_input}. Error: {str(e)}. Let's try again! 😊")
-            return SINGER
-
-    # Proceed with downloading the selected song
-    try:
-        songs = user_data[chat_id]['songs']
-        singer = user_data[chat_id]['singer']
+                    logger.error(f"Error deleting temporary file: {e}", exc_info=True)
         
-        if song_idx < 0 or song_idx >= len(songs):
-            await update.message.reply_text("Please choose a valid number from the playlist! 😊")
-            return DOWNLOAD
-
-        song_name, yt_url = songs[song_idx]
-        await update.message.reply_text(f"⬇️ Downloading {song_name}... Please wait a moment! 😊")
-
-        try:
-            # Sanitize filename
-            safe_name = "".join(c for c in song_name if c.isalnum() or c in " _-")
-            audio_path = await download_youtube_audio(yt_url, f"{singer}_{safe_name}")
-            
-            if not audio_path:
-                await update.message.reply_text("Sorry, I couldn't download this song. Let's try another one! 😊")
-                return DOWNLOAD
-
-            # Check file size (Telegram has a 50MB limit)
-            file_size = os.path.getsize(audio_path) / (1024 * 1024)
-            if file_size > CONFIG['MAX_FILE_SIZE_MB']:
-                await update.message.reply_text(f"Sorry, the file {song_name} is {file_size:.2f}MB, which is larger than Telegram's 50MB limit. Please try another song! 😊")
-                os.remove(audio_path)
-            else:
-                with open(audio_path, 'rb') as audio_file:
-                    await update.message.reply_audio(audio=audio_file, title=song_name, performer=singer, timeout=60)  # Increased timeout
-                await update.message.reply_text(f"{song_name} downloaded! Enjoy the music! 😊❤️")
-            
-            # Clean up
-            try:
-                os.remove(audio_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary file {audio_path}: {str(e)}")
-
-        except Exception as e:
-            logger.error(f"Download error for {song_name}: {str(e)}")
-            await update.message.reply_text(f"Error while downloading {song_name}. Error: {str(e)}. Let's try another song! 😊")
-            return DOWNLOAD
-
-        # Show the playlist again
-        playlist_text = f"🎵 Playlist for {singer}:\n\n"
-        for idx, (song_name, _) in enumerate(songs, 1):
-            playlist_text += f"{idx}. {song_name}\n"
-        playlist_text += "\nWhich song would you like to download? Type the number! Or, type a new singer's name to create another playlist! 🌟"
-        await update.message.reply_text(playlist_text)
-        return DOWNLOAD
-
+        # Ask if user wants to select another song
+        await update.message.reply_text(
+            "Would you like to download another song from this playlist? "
+            "Type the number! Or, type a new singer's name to create another playlist! 🌟"
+        )
+        
+        return SONG_SELECTION
+    
+    except (IndexError, KeyError, ValueError) as e:
+        logger.error(f"Invalid selection: {e}", exc_info=True)
+        await update.message.reply_text(
+            "Please enter a valid number from the playlist or a new artist name! 😊"
+        )
+        return SONG_SELECTION
     except Exception as e:
-        logger.error(f"Error in download_song: {str(e)}")
-        await update.message.reply_text(f"Oops! Something went wrong while downloading. Error: {str(e)}. Let's try again! 😊")
-        return DOWNLOAD
+        logger.error(f"Unexpected error in download_song: {e}", exc_info=True)
+        await update.message.reply_text(
+            "Something went wrong. Let's start over with a new artist! 😊"
+        )
+        return ARTIST
 
-# Cancel command
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Operation cancelled. Type /start to begin again! 😊")
+    """Cancel the current operation."""
+    user = update.message.from_user
+    logger.info(f"User {user.id} canceled the conversation.")
+    
+    await update.message.reply_text(
+        "Okay, let's start over when you're ready! Just send /start to begin again. 😊"
+    )
+    
     return ConversationHandler.END
 
-# Main function to run the bot
-def main():
-    try:
-        logger.info("Starting bot...")
-        
-        application = Application.builder().token(CONFIG['TELEGRAM_TOKEN']).build()
 
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('start', start)],
-            states={
-                LANGUAGE: [CallbackQueryHandler(language_selection, pattern='^lang_')],
-                SINGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, singer_name)],
-                DOWNLOAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, download_song)]
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-            per_message=False
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and send a user-friendly message."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    if update and hasattr(update, "message"):
+        await update.message.reply_text(
+            "Oops! Something went wrong. Let's try again! 😊"
         )
 
-        application.add_handler(conv_handler)
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        logger.error(f"Bot crashed: {str(e)}")
-        raise
 
-if __name__ == '__main__':
+def main() -> None:
+    """Run the bot."""
+    # Create the Application
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Set up conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            LANGUAGE: [CallbackQueryHandler(language_selection)],
+            ARTIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_artist)],
+            SONG_SELECTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, download_song)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    
+    # Add handlers
+    application.add_handler(conv_handler)
+    application.add_error_handler(error_handler)
+    
+    # Run the bot
+    application.run_polling()
+
+
+if __name__ == "__main__":
     main()
