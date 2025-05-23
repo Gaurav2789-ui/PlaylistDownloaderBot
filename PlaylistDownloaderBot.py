@@ -28,9 +28,9 @@ user_data = {}
 
 # Configuration
 CONFIG = {
-    'SPOTIFY_CLIENT_ID': "50fc266de6b14576b35a328118d1f201",
-    'SPOTIFY_CLIENT_SECRET': "bc4cdea56a3a4b71b4e5712cc5feec1a",
-    'TELEGRAM_TOKEN': "8161736164:AAHOHDKwM9fWvrOa_GNMPa-KAmfKz9F5gSE",
+    'SPOTIFY_CLIENT_ID': os.getenv('SPOTIFY_CLIENT_ID'),
+    'SPOTIFY_CLIENT_SECRET': os.getenv('SPOTIFY_CLIENT_SECRET'),
+    'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
     'MAX_FILE_SIZE_MB': 50,
     'TEMP_DIR': 'temp_downloads',
 }
