@@ -50,32 +50,40 @@ except Exception as e:
     logger.error(f"Spotify setup failed: {str(e)}")
     raise
 
-# Function to search YouTube using yt-dlp (try up to 3 results with fallback queries)
+# Function to search YouTube using yt-dlp (updated for better matching)
 async def search_youtube(song_name: str, singer: str) -> str:
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True,
         'force_generic_extractor': True,
+        'geo_bypass': True,  # Bypass geographic restrictions
+        'no_check_certificate': True,  # Avoid SSL issues
     }
+    # Broaden the search queries to match common video titles
     search_queries = [
+        f"{song_name} {singer} official video",
         f"{song_name} {singer} official audio",
+        f"{song_name} {singer} official",
         f"{song_name} {singer}",
-        f"{song_name} audio"
+        f"{song_name} audio {singer}",
+        f"{song_name} by {singer}",
     ]
     for query in search_queries:
         try:
             logger.info(f"Searching YouTube with query: {query}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(f"ytsearch3:{query}", download=False)
+                result = ydl.extract_info(f"ytsearch5:{query}", download=False)  # Increase to 5 results
                 if 'entries' in result and result['entries']:
-                    for entry in result['entries'][:3]:
+                    for entry in result['entries'][:5]:
                         url = entry['url']
                         test_opts = {
                             'format': 'bestaudio/best',
                             'quiet': True,
                             'no_warnings': True,
                             'simulate': True,
+                            'geo_bypass': True,
+                            'no_check_certificate': True,
                         }
                         with yt_dlp.YoutubeDL(test_opts) as test_ydl:
                             try:
