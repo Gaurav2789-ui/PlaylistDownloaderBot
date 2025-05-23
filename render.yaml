@@ -1,5 +1,5 @@
 services:
-  - type: worker  # Changed from 'web' to 'worker'
+  - type: web
     name: playlistdownloaderbot
     env: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
@@ -12,4 +12,4 @@ services:
       - key: SPOTIFY_CLIENT_SECRET
         value: bc4cdea56a3a4b71b4e5712cc5feec1a
       - key: WEBHOOK_URL
-        value: ""
+        value: https://playlistdownloaderbot.onrender.com
