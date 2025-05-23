@@ -1,5 +1,5 @@
 ﻿python-telegram-bot==20.8
-yt-dlp==2025.5.23
+yt-dlp==2025.5.22
 spotipy==2.24.0
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
