@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: playlistdownloaderbot
+    env: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python PlaylistDownloaderBot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        value: 7847425059:AAFviOFyNIefhQqAD1-DFgWzwB7WpcMUrk0
+      - key: SPOTIFY_CLIENT_ID
+        value: 50fc266de6b14576b35a328118d1f201
+      - key: SPOTIFY_CLIENT_SECRET
+        value: bc4cdea56a3a4b71b4e5712cc5feec1a
+      - key: WEBHOOK_URL
+        value: ""
